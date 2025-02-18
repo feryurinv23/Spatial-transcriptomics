@@ -1,1 +1,133 @@
+# Load required packages
+library(Seurat)
+library(harmony)
+library(dplyr)
+library(ggplot2)
+library(clustree)
+library(org.Hs.eg.db)
+library(tidyverse)
+library(ggthemes)
 
+# Main directory containing the folders
+main_directory <- "~/Spatil transcriptomes/GSE208747/"
+
+# List all folders in the main directory
+folders <- list.dirs(main_directory, full.names = TRUE, recursive = FALSE)
+
+# Create a mapping vector for disease_type using abbreviations
+disease_map <- c(
+  A1 = "multiple sclerosis", A2 = "multiple sclerosis", A3 = "multiple sclerosis", A4 = "multiple sclerosis",
+  C1 = "non-demented control", C2 = "non-demented control",
+  CG1 = "non-demented control", CG2 = "non-demented control", CG3 = "non-demented control",
+  M1 = "multiple sclerosis", M2 = "multiple sclerosis", M3 = "multiple sclerosis", 
+  M4 = "multiple sclerosis", M5 = "multiple sclerosis", M6 = "multiple sclerosis",
+  N1 = "multiple sclerosis", N2 = "multiple sclerosis", N3 = "multiple sclerosis",
+  NG1 = "multiple sclerosis", NG2 = "multiple sclerosis", NG3 = "multiple sclerosis",
+  SG1 = "multiple sclerosis", SG2 = "multiple sclerosis", SG3 = "multiple sclerosis",
+  SG4 = "multiple sclerosis", SG5 = "multiple sclerosis"
+)
+
+# Loop to create a Seurat object for each folder
+for (folder in folders) {
+  # Define image directory and H5 file
+  imag_directory <- file.path(folder, "spatial")
+  
+  # Read the image
+  img <- Read10X_Image(image.dir = imag_directory,
+                       image.name = "tissue_lowres_image.png")
+  
+  # Load spatial data into the Seurat object
+  seurat_obj <- Load10X_Spatial(data.dir = folder,
+                                filename = "filtered_feature_bc_matrix.h5",
+                                image = img, 
+                                assay = "Spatial")
+  
+  # Extract the folder name to use as the object name
+  sample_name <- basename(folder)
+  
+  # Add a new column to metadata with the object name
+  seurat_obj <- AddMetaData(seurat_obj, metadata = sample_name, col.name = "Sample_Name")
+  
+  # Create a new column with only the abbreviation without the number
+  abbreviation_only <- sub("\\d+", "", sample_name)  # Remove numbers from the name
+  seurat_obj <- AddMetaData(seurat_obj, metadata = abbreviation_only, col.name = "Subtype_disease")
+  
+  # Check if sample_name is in disease_map
+  if (sample_name %in% names(disease_map)) {
+    # Add the disease_type column to metadata
+    disease_type <- disease_map[[sample_name]]  # Get the corresponding disease type
+    seurat_obj <- AddMetaData(seurat_obj, metadata = disease_type, col.name = "disease_type")
+  } else {
+    # If not found, print an error message
+    warning(paste("Sample name not found in disease_map:", sample_name))
+  }
+  
+  # Rename cell IDs to ensure uniqueness
+  seurat_obj <- RenameCells(seurat_obj, new.names = paste(sample_name, colnames(seurat_obj), sep = "_"))
+  
+  # Assign the object name in the global environment
+  assign(sample_name, seurat_obj)
+}
+
+remove(abbreviation_only, disease_map, disease_type, folder, folders, imag_directory, 
+       img, main_directory, seurat_obj, sample_name)
+
+combined_seurat_object <- merge(NG3, y = c(A1,A2,A3,A4,C1,C2,CG1,CG2,CG3,M1,M2,
+                                           M3,M4,M5,M6,N1,N2,N3,NG1,NG2,SG1,SG2,SG3,SG4,SG5),
+                                add.cell.ids = ls()[1:26],
+                                project = 'SP')
+
+######## Batch correction by Harmony -----
+combined_seurat_object[["percent.mt"]] <- PercentageFeatureSet(combined_seurat_object, pattern = "^MT-")
+
+combined_seurat_object <- subset(
+  combined_seurat_object,
+  subset = percent.mt < 20
+)
+
+combined_seurat_object <- NormalizeData(combined_seurat_object) %>% 
+  FindVariableFeatures() %>% ScaleData() %>% RunPCA(verbose = FALSE)
+
+ElbowPlot(combined_seurat_object)
+
+combined_seurat_object <- RunUMAP(combined_seurat_object, dims = 1:10)
+DimPlot(combined_seurat_object, reduction = "umap", label = TRUE, 
+        group.by = "disease_type")
+
+combined_seurat_object <- RunHarmony(combined_seurat_object, 
+                                     group.by.vars = "disease_type")
+
+ElbowPlot(combined_seurat_object, reduction = "harmony")
+
+combined_seurat_object <- RunUMAP(combined_seurat_object, 
+                                  reduction = "harmony", dims = 1:20)
+
+combined_seurat_object <- FindNeighbors(combined_seurat_object, 
+                                        reduction = "harmony", dims = 1:20) %>% 
+  FindClusters(resolution = c(0.4))
+
+clustree(combined_seurat_object, prefix = "Spatial_snn_res.")
+combined_seurat_object <- JoinLayers(combined_seurat_object, assay = "Spatial")
+
+###### Cell Identification ----
+p1 <- DotPlot(combined_seurat_object, 
+              features = c("CD38", "PRDM1", "CD19", # B-cell
+                           "GFAP", "AQP4", "S100B", # Astrocytes
+                           "MAP2", "GAP43","RBFOX3", # Neuronal cells
+                           "OLIG2","MOG","SOX10", # Oligodendrocytes
+                           "VWF", "ICAM1", "CD34", # Endothelial cells
+                           "CD14","CCR2","CD163", # Macrophages
+                           "CD4", "CD3E","CD8A", # T Cells
+                           "CD68","IBA1","TREM2" # Microglia
+              ), 
+              assay = "Spatial", cols = c("#FFBE98","#0B8494")) + theme_bw() + 
+  theme(axis.text.x = element_text(angle = 270, size = 14),
+        axis.text.y = element_text(angle = 270,size = 14))
+
+png(filename = "Spatial gene expression.png",
+    width = 3500,height = 2000,
+    units = "px",bg = "transparent",res = 300)
+p1
+dev.off()
+
+saveRDS(combined_seurat_object, "spatial_obj_seurat.rds")
